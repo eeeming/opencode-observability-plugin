@@ -236,7 +236,7 @@ export class LangfuseClient {
     const span = this.traceState.tracer.startSpan("opencode.turn", {
       attributes: {
         "langfuse.observation.type": "span",
-        "langfuse.internal.as_root": true,
+        "langfuse.internal.is_app_root": true,
         "session.id": input.sessionID,
         "langfuse.observation.input": JSON.stringify(formattedInput),
         "langfuse.observation.metadata": JSON.stringify({
@@ -686,6 +686,24 @@ const makePluginVersionSpanProcessor = () =>
     forceFlush: () => Promise.resolve(),
   }) satisfies SpanProcessor;
 
+// Langfuse's OTEL processor may auto-mark exported spans as app roots, this overrides that.
+const makeAppRootSpanProcessor = (tracerName: string) =>
+  ({
+    onStart: (span: Span, _parentContext: unknown) => {
+      if (span.instrumentationScope.name !== tracerName) {
+        return;
+      }
+
+      span.setAttribute(
+        "langfuse.internal.is_app_root",
+        span.name === "opencode.turn",
+      );
+    },
+    onEnd: (_span: ReadableSpan) => {},
+    shutdown: () => Promise.resolve(),
+    forceFlush: () => Promise.resolve(),
+  }) satisfies SpanProcessor;
+
 export const createLangfuseClient = (input: {
   publicKey: string;
   secretKey: string;
@@ -723,6 +741,7 @@ export const createLangfuseClient = (input: {
         makePluginVersionSpanProcessor(),
         ...(input.userId ? [makeUserIdSpanProcessor(input.userId)] : []),
         processor,
+        makeAppRootSpanProcessor(traceState.tracerName),
       ],
     });
     let isShutdown = false;
