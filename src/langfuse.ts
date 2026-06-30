@@ -324,17 +324,24 @@ export class LangfuseClient {
 
     this.traceState.tracedGenerationIds.add(input.messageID);
 
-    const output = this.getAssistantText(input.messageID);
+    const output = {
+      role: "assistant" as const,
+      content: this.getAssistantText(input.messageID),
+    };
+    if (input.mode !== "compaction") {
+      const turn = this.getTurnObservation(input.sessionID, input.parentID);
+      turn?.span.setAttribute(
+        "langfuse.observation.output",
+        JSON.stringify(output),
+      );
+    }
     const step = this.traceState.activeGenerationSteps.get(input.sessionID);
 
     if (step) {
       step.span.setAttribute("langfuse.observation.model.name", input.modelID);
       step.span.setAttribute(
         "langfuse.observation.output",
-        JSON.stringify({
-          role: "assistant",
-          content: output,
-        }),
+        JSON.stringify(output),
       );
       step.span.setAttribute(
         "langfuse.observation.usage_details",
@@ -379,10 +386,7 @@ export class LangfuseClient {
           "langfuse.observation.type": "generation",
           "session.id": input.sessionID,
           "langfuse.observation.model.name": input.modelID,
-          "langfuse.observation.output": JSON.stringify({
-            role: "assistant",
-            content: output,
-          }),
+          "langfuse.observation.output": JSON.stringify(output),
           "langfuse.observation.usage_details": JSON.stringify({
             input: input.tokens.input,
             output: input.tokens.output,
@@ -572,15 +576,20 @@ export class LangfuseClient {
     messageID: string | undefined,
     fn: () => T,
   ) {
-    const parentSpan =
-      (messageID
-        ? this.traceState.turnObservationsByMessageId.get(messageID)?.span
-        : undefined) ??
-      this.traceState.latestTurnObservationsBySession.get(sessionID)?.span;
+    const parentSpan = this.getTurnObservation(sessionID, messageID)?.span;
 
     return parentSpan
       ? context.with(trace.setSpan(context.active(), parentSpan), fn)
       : fn();
+  }
+
+  private getTurnObservation(sessionID: string, messageID: string | undefined) {
+    return (
+      (messageID
+        ? this.traceState.turnObservationsByMessageId.get(messageID)
+        : undefined) ??
+      this.traceState.latestTurnObservationsBySession.get(sessionID)
+    );
   }
 
   private withObservationParent<T>(sessionID: string, fn: () => T) {
