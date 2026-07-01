@@ -9,6 +9,7 @@ import {
   LangfuseClientService,
   createLangfuseClient,
   type ActiveGenerationStep,
+  type LangfuseClient,
 } from "./langfuse.js";
 import { OpencodeClientService } from "./opencode.js";
 import { log } from "./utils.js";
@@ -126,27 +127,40 @@ const loadLangfuseCredentials = Effect.gen(function* () {
   return credentials;
 });
 
-const eventHook = (event: OpencodeEvent) =>
+const eventHook = (event: OpencodeEvent, shutdown?: () => Promise<void>) =>
   Effect.gen(function* () {
     const langfuse = yield* LangfuseClientService;
 
-    if (event.type === "session.idle") {
-      yield* log("info", "Flushing spans");
+    const finalizeSessionTracing = () => {
       langfuse.endActiveToolObservations();
       langfuse.endActiveGenerationSteps();
       langfuse.endActiveTurnObservations();
       langfuse.clearTraceState();
+    };
+
+    if (event.type === "session.idle") {
+      yield* log("info", "Flushing spans");
+      finalizeSessionTracing();
 
       yield* langfuse.forceFlush;
     }
 
     if (event.type === "server.instance.disposed") {
-      langfuse.endActiveToolObservations();
-      langfuse.endActiveGenerationSteps();
-      langfuse.endActiveTurnObservations();
-      langfuse.clearTraceState();
+      finalizeSessionTracing();
 
-      yield* langfuse.shutdown;
+      if (shutdown) {
+        yield* Effect.tryPromise({
+          try: () => shutdown(),
+          catch: (error) => error,
+        });
+      }
+    }
+
+    if (event.type === "session.error" && event.properties.sessionID) {
+      langfuse.traceSessionError({
+        sessionID: event.properties.sessionID,
+        error: event.properties.error,
+      });
     }
 
     if (event.type === "message.part.updated") {
@@ -247,6 +261,18 @@ const formatHookError = (error: unknown) => {
   }
 };
 
+const createShutdownOnce = (langfuse: LangfuseClient) => {
+  let shutdownPromise: Promise<void> | undefined;
+
+  return () => {
+    if (!shutdownPromise) {
+      shutdownPromise = Effect.runPromise(langfuse.shutdown);
+    }
+
+    return shutdownPromise;
+  };
+};
+
 const main = Effect.gen(function* () {
   const opencode = yield* OpencodeClientService;
 
@@ -290,6 +316,14 @@ const main = Effect.gen(function* () {
     Layer.succeed(LangfuseClientService, langfuse),
   );
 
+  const finalizeTracing = Effect.sync(() => {
+    langfuse.endActiveToolObservations();
+    langfuse.endActiveGenerationSteps();
+    langfuse.endActiveTurnObservations();
+    langfuse.clearTraceState();
+  });
+  const shutdownOnce = createShutdownOnce(langfuse);
+
   const runHook = (
     hookName: string,
     effect: Effect.Effect<
@@ -318,6 +352,19 @@ const main = Effect.gen(function* () {
     );
 
   const hooks: Hooks = {
+    dispose: () =>
+      runHook(
+        "dispose",
+        finalizeTracing.pipe(
+          Effect.zipRight(
+            Effect.tryPromise({
+              try: () => shutdownOnce(),
+              catch: (error) => error,
+            }),
+          ),
+        ),
+      ),
+
     config: (config) =>
       runHook(
         "config",
@@ -331,7 +378,7 @@ const main = Effect.gen(function* () {
         }),
       ),
 
-    event: ({ event }) => runHook("event", eventHook(event)),
+    event: ({ event }) => runHook("event", eventHook(event, shutdownOnce)),
 
     "chat.message": (input, output) =>
       runHook(

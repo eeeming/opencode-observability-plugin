@@ -32,26 +32,56 @@ export class LangfuseClient {
 
   clearTraceState() {
     this.traceState.assistantParts.clear();
+    this.traceState.abortedSessions.clear();
     this.traceState.tracedEventIds.clear();
     this.traceState.generationParentSpans.clear();
     this.traceState.turnObservationsByMessageId.clear();
     this.traceState.latestTurnObservationsBySession.clear();
   }
 
-  endActiveToolObservations() {
-    for (const observation of this.traceState.activeToolObservations.values()) {
-      observation.span.end();
-    }
+  endActiveToolObservations(sessionID?: string, error?: SessionErrorInfo) {
+    for (const [callID, observation] of this.traceState
+      .activeToolObservations) {
+      if (sessionID && observation.sessionID !== sessionID) {
+        continue;
+      }
 
-    this.traceState.activeToolObservations.clear();
+      if (error && error.name !== "MessageAbortedError") {
+        const message = this.getSessionErrorMessage(error);
+
+        observation.span.setStatus({
+          code: SpanStatusCode.ERROR,
+          message,
+        });
+        observation.span.recordException({ message, name: error.name });
+      }
+
+      observation.span.end();
+      this.traceState.activeToolObservations.delete(callID);
+    }
   }
 
-  endActiveGenerationSteps() {
-    for (const step of this.traceState.activeGenerationSteps.values()) {
-      step.span.end();
-    }
+  endActiveGenerationSteps(sessionID?: string, error?: SessionErrorInfo) {
+    for (const [activeSessionID, step] of this.traceState
+      .activeGenerationSteps) {
+      if (sessionID && activeSessionID !== sessionID) {
+        continue;
+      }
 
-    this.traceState.activeGenerationSteps.clear();
+      if (error && error.name !== "MessageAbortedError") {
+        const message = this.getSessionErrorMessage(error);
+
+        step.span.setStatus({
+          code: SpanStatusCode.ERROR,
+          message,
+        });
+        step.span.recordException({ message, name: error.name });
+      }
+
+      step.span.end();
+      this.traceState.activeGenerationSteps.delete(activeSessionID);
+      this.traceState.generationParentSpans.delete(activeSessionID);
+    }
   }
 
   endActiveTurnObservations() {
@@ -138,6 +168,10 @@ export class LangfuseClient {
 
     existingStep?.span.end(new Date(input.started));
 
+    if (!this.getTurnObservation(input.sessionID, undefined)) {
+      return;
+    }
+
     this.withTurnParent(input.sessionID, undefined, () => {
       const span = this.traceState.tracer.startSpan("opencode.generation", {
         attributes: {
@@ -178,6 +212,8 @@ export class LangfuseClient {
     ) {
       return;
     }
+
+    this.traceState.abortedSessions.delete(input.sessionID);
 
     const formattedInput = {
       role: "user" as const,
@@ -318,6 +354,10 @@ export class LangfuseClient {
       cache: { read: number; write: number };
     };
   }) {
+    if (this.traceState.abortedSessions.has(input.sessionID)) {
+      return;
+    }
+
     if (this.traceState.tracedGenerationIds.has(input.messageID)) {
       return;
     }
@@ -328,8 +368,9 @@ export class LangfuseClient {
       role: "assistant" as const,
       content: this.getAssistantText(input.messageID),
     };
+    const turn = this.getTurnObservation(input.sessionID, input.parentID);
+
     if (input.mode !== "compaction") {
-      const turn = this.getTurnObservation(input.sessionID, input.parentID);
       turn?.span.setAttribute(
         "langfuse.observation.output",
         JSON.stringify(output),
@@ -377,6 +418,10 @@ export class LangfuseClient {
       step.span.end(new Date(input.completed));
       this.traceState.activeGenerationSteps.delete(input.sessionID);
 
+      return;
+    }
+
+    if (!turn) {
       return;
     }
 
@@ -456,6 +501,10 @@ export class LangfuseClient {
       return;
     }
 
+    if (!this.getTurnObservation(input.sessionID, undefined)) {
+      return;
+    }
+
     this.withTurnParent(input.sessionID, undefined, () => {
       const span = this.traceState.tracer.startSpan(
         "opencode.generation.failed",
@@ -479,6 +528,49 @@ export class LangfuseClient {
       this.traceState.generationParentSpans.set(input.sessionID, span);
       span.end(new Date(input.completed));
     });
+  }
+
+  traceSessionError(input: { sessionID: string; error?: SessionErrorInfo }) {
+    this.endActiveToolObservations(input.sessionID, input.error);
+    this.endActiveGenerationSteps(input.sessionID, input.error);
+
+    if (input.error?.name === "MessageAbortedError") {
+      this.traceState.abortedSessions.add(input.sessionID);
+    }
+
+    const turn = this.getTurnObservation(input.sessionID, undefined);
+
+    if (!turn) {
+      this.traceState.generationParentSpans.delete(input.sessionID);
+
+      return;
+    }
+
+    if (input.error) {
+      turn.span.setAttribute(
+        "langfuse.observation.output",
+        JSON.stringify({ error: input.error }),
+      );
+
+      if (input.error.name !== "MessageAbortedError") {
+        const message = this.getSessionErrorMessage(input.error);
+
+        turn.span.setStatus({
+          code: SpanStatusCode.ERROR,
+          message,
+        });
+        turn.span.recordException({ message, name: input.error.name });
+      }
+    }
+
+    turn.span.end();
+
+    if (turn.messageID) {
+      this.traceState.turnObservationsByMessageId.delete(turn.messageID);
+    }
+
+    this.traceState.latestTurnObservationsBySession.delete(input.sessionID);
+    this.traceState.generationParentSpans.delete(input.sessionID);
   }
 
   traceToolStart(input: {
@@ -558,6 +650,10 @@ export class LangfuseClient {
       return;
     }
 
+    if (!this.getTurnObservation(sessionID, undefined)) {
+      return;
+    }
+
     this.withTurnParent(sessionID, undefined, () => {
       const span = this.traceState.tracer.startSpan("opencode.generation", {
         attributes: {
@@ -613,11 +709,30 @@ export class LangfuseClient {
       .map((part) => part.text)
       .join("");
   }
+
+  private getSessionErrorMessage(error: SessionErrorInfo) {
+    if ("message" in error && typeof error.message === "string") {
+      return error.message;
+    }
+
+    if (
+      "data" in error &&
+      error.data &&
+      typeof error.data === "object" &&
+      "message" in error.data &&
+      typeof error.data.message === "string"
+    ) {
+      return error.data.message;
+    }
+
+    return error.name;
+  }
 }
 
 export type LangfuseTraceState = {
   tracerName: string;
   tracer: Tracer;
+  abortedSessions: Set<string>;
   tracedMessageIds: Set<string>;
   tracedGenerationIds: Set<string>;
   tracedEventIds: Set<string>;
@@ -641,6 +756,13 @@ export type FormattedMessagePart =
   | { type: string; prompt?: string; agent?: string }
   | { type: string; tool?: string; title?: string }
   | { type: string };
+
+export type SessionError = Extract<
+  Parameters<NonNullable<Hooks["event"]>>[0]["event"],
+  { type: "session.error" }
+>["properties"]["error"];
+
+export type SessionErrorInfo = NonNullable<SessionError>;
 
 export type UserMessageInput = {
   role: "user";
@@ -725,6 +847,7 @@ export const createLangfuseClient = (input: {
     const traceState: LangfuseTraceState = {
       tracerName,
       tracer: trace.getTracer(tracerName, PLUGIN_VERSION),
+      abortedSessions: new Set<string>(),
       tracedMessageIds: new Set<string>(),
       tracedGenerationIds: new Set<string>(),
       tracedEventIds: new Set<string>(),
