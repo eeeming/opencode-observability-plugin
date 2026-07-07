@@ -2,7 +2,7 @@ import { LangfuseSpanProcessor } from "@langfuse/otel";
 import type { Hooks } from "@opencode-ai/plugin";
 import { SpanStatusCode, context, trace } from "@opentelemetry/api";
 import type { Span as ApiSpan, Tracer } from "@opentelemetry/api";
-import { NodeSDK } from "@opentelemetry/sdk-node";
+import { NodeTracerProvider } from "@opentelemetry/sdk-trace-node";
 import type {
   ReadableSpan,
   Span,
@@ -1014,7 +1014,7 @@ export const createLangfuseClient = (input: {
     const tracerName = "opencode-langfuse-plugin";
     const traceState: LangfuseTraceState = {
       tracerName,
-      tracer: trace.getTracer(tracerName, PLUGIN_VERSION),
+      tracer: null as unknown as Tracer,
       abortedSessions: new Set<string>(),
       tracedMessageIds: new Set<string>(),
       tracedGenerationIds: new Set<string>(),
@@ -1042,7 +1042,7 @@ export const createLangfuseClient = (input: {
         otelSpan.instrumentationScope.name === traceState.tracerName,
     });
 
-    const sdk = new NodeSDK({
+    const provider = new NodeTracerProvider({
       spanProcessors: [
         makePluginVersionSpanProcessor(),
         ...(input.userId ? [makeUserIdSpanProcessor(input.userId)] : []),
@@ -1050,9 +1050,9 @@ export const createLangfuseClient = (input: {
         makeAppRootSpanProcessor(traceState.tracerName),
       ],
     });
+    provider.register();
+    traceState.tracer = provider.getTracer(tracerName, PLUGIN_VERSION);
     let isShutdown = false;
-
-    yield* Effect.sync(() => sdk.start());
 
     return new LangfuseClient({
       baseUrl: input.baseUrl,
@@ -1069,7 +1069,7 @@ export const createLangfuseClient = (input: {
         yield* Effect.tryPromise(() => processor.forceFlush()).pipe(
           Effect.catchAll(() => Effect.void),
         );
-        yield* Effect.tryPromise(() => sdk.shutdown());
+        yield* Effect.tryPromise(() => provider.shutdown());
       }),
     });
   });
